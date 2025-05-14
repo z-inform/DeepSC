@@ -12,24 +12,26 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-class EurDataset(Dataset):
-    def __init__(self, split='train'):
-        data_dir = '/import/antennas/Datasets/hx301/'
-        with open(data_dir + 'europarl/{}_data.pkl'.format(split), 'rb') as f:
-            self.data = pickle.load(f)
 
+class EurDataset(Dataset):
+    def __init__(self, split="train"):
+        data_dir = "./"
+        with open(data_dir + "europarl/{}_data.pkl".format(split), "rb") as f:
+            self.data = pickle.load(f)
 
     def __getitem__(self, index):
         sents = self.data[index]
-        return  sents
+        return sents
 
     def __len__(self):
         return len(self.data)
 
-def collate_data(batch):
 
+def collate_data(batch):
     batch_size = len(batch)
-    max_len = max(map(lambda x: len(x), batch))   # get the max length of sentence in current batch
+    max_len = max(
+        map(lambda x: len(x), batch)
+    )  # get the max length of sentence in current batch
     sents = np.zeros((batch_size, max_len), dtype=np.int64)
     sort_by_len = sorted(batch, key=lambda x: len(x), reverse=True)
 
@@ -37,4 +39,4 @@ def collate_data(batch):
         length = len(sent)
         sents[i, :length] = sent  # padding the questions
 
-    return  torch.from_numpy(sents)
+    return torch.from_numpy(sents)
