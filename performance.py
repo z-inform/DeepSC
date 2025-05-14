@@ -5,6 +5,7 @@
 @File: performance.py
 @Time: 2021/4/1 11:48
 """
+from transformers import BertTokenizer, TFBertModel
 import os
 import json
 import torch
@@ -16,37 +17,136 @@ from torch.utils.data import DataLoader
 from utils import BleuScore, SNR_to_noise, greedy_decode, SeqtoText
 from tqdm import tqdm
 from sklearn.preprocessing import normalize
+from tensorflow import keras
+import tensorflow as tf
+
+config = tf.compat.v1.ConfigProto()
+config.gpu_options.allow_growth = True
+config.gpu_options.per_process_gpu_memory_fraction = 0.0
+session = tf.compat.v1.Session(config=config)
+
 # from bert4keras.backend import keras
 # from bert4keras.models import build_bert_model
+
 # from bert4keras.tokenizers import Tokenizer
+# from bert4keras.bert import build_bert_model
+
 from w3lib.html import remove_tags
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--data-dir', default='europarl/train_data.pkl', type=str)
-parser.add_argument('--vocab-file', default='europarl/vocab.json', type=str)
-parser.add_argument('--checkpoint-path', default='checkpoints/deepsc-Rayleigh', type=str)
-parser.add_argument('--channel', default='Rayleigh', type=str)
-parser.add_argument('--MAX-LENGTH', default=30, type=int)
-parser.add_argument('--MIN-LENGTH', default=4, type=int)
-parser.add_argument('--d-model', default=128, type = int)
-parser.add_argument('--dff', default=512, type=int)
-parser.add_argument('--num-layers', default=4, type=int)
-parser.add_argument('--num-heads', default=8, type=int)
-parser.add_argument('--batch-size', default=64, type=int)
-parser.add_argument('--epochs', default=2, type = int)
-parser.add_argument('--bert-config-path', default='bert/cased_L-12_H-768_A-12/bert_config.json', type = str)
-parser.add_argument('--bert-checkpoint-path', default='bert/cased_L-12_H-768_A-12/bert_model.ckpt', type = str)
-parser.add_argument('--bert-dict-path', default='bert/cased_L-12_H-768_A-12/vocab.txt', type = str)
+parser.add_argument("--data-dir", default="europarl/train_data.pkl", type=str)
+parser.add_argument("--vocab-file", default="europarl/vocab.json", type=str)
+parser.add_argument(
+    "--checkpoint-path", default="checkpoints/deepsc-Rayleigh", type=str
+)
+parser.add_argument("--channel", default="Rayleigh", type=str)
+parser.add_argument("--MAX-LENGTH", default=30, type=int)
+parser.add_argument("--MIN-LENGTH", default=4, type=int)
+parser.add_argument("--d-model", default=128, type=int)
+parser.add_argument("--dff", default=512, type=int)
+parser.add_argument("--num-layers", default=4, type=int)
+parser.add_argument("--num-heads", default=8, type=int)
+parser.add_argument("--batch-size", default=64, type=int)
+parser.add_argument("--epochs", default=2, type=int)
+parser.add_argument(
+    "--bert-config-path",
+    default="bert/cased_L-12_H-768_A-12/bert_config.json",
+    type=str,
+)
+parser.add_argument(
+    "--bert-checkpoint-path",
+    default="bert/cased_L-12_H-768_A-12/bert_model.ckpt",
+    type=str,
+)
+parser.add_argument("--bert-dict-path", default="bert/assets/vocab.txt", type=str)
+parser.add_argument("--n-gram", default=4, type=int)
+parser.add_argument("--compute-similarity", action="store_true", default=False)
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
+class Similarity:
+    def __init__(self, model_path):
+        # Load the BERT model and tokenizer
+        self.tokenizer = BertTokenizer.from_pretrained(model_path)
+        self.bert_model = TFBertModel.from_pretrained(model_path, from_pt=True)
+
+        # Create a model that outputs the last hidden layer (layer 11)
+        input_ids = keras.Input(shape=(None,), dtype="int32")
+        attention_mask = keras.Input(shape=(None,), dtype="int32")
+        token_type_ids = keras.Input(shape=(None,), dtype="int32")
+
+        outputs = self.bert_model(
+            input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids
+        )
+        last_hidden_layer = outputs.last_hidden_state
+
+        self.model = keras.Model(
+            inputs=[input_ids, attention_mask, token_type_ids],
+            outputs=last_hidden_layer,
+        )
+
+    def compute_similarity(self, real, predicted):
+        token_ids1, attention_mask1, segment_ids1 = [], [], []
+        token_ids2, attention_mask2, segment_ids2 = [], [], []
+        score = []
+
+        for sent1, sent2 in zip(real, predicted):
+            sent1 = remove_tags(sent1)
+            sent2 = remove_tags(sent2)
+
+            # Tokenize the sentences
+            encoded1 = self.tokenizer.encode_plus(
+                sent1, max_length=32, pad_to_max_length=True, truncation=True
+            )
+            encoded2 = self.tokenizer.encode_plus(
+                sent2, max_length=32, pad_to_max_length=True, truncation=True
+            )
+
+            token_ids1.append(encoded1["input_ids"])
+            attention_mask1.append(encoded1["attention_mask"])
+            segment_ids1.append(encoded1["token_type_ids"])
+
+            token_ids2.append(encoded2["input_ids"])
+            attention_mask2.append(encoded2["attention_mask"])
+            segment_ids2.append(encoded2["token_type_ids"])
+
+        # Convert to numpy arrays
+        token_ids1 = np.array(token_ids1)
+        attention_mask1 = np.array(attention_mask1)
+        segment_ids1 = np.array(segment_ids1)
+
+        token_ids2 = np.array(token_ids2)
+        attention_mask2 = np.array(attention_mask2)
+        segment_ids2 = np.array(segment_ids2)
+
+        # Get embeddings
+        vector1 = self.model.predict([token_ids1, attention_mask1, segment_ids1])
+        vector2 = self.model.predict([token_ids2, attention_mask2, segment_ids2])
+
+        # Sum along the sequence dimension (axis=1)
+        vector1 = np.sum(vector1, axis=1)
+        vector2 = np.sum(vector2, axis=1)
+
+        # Normalize the vectors
+        vector1 = normalize(vector1, axis=1, norm="l2")
+        vector2 = normalize(vector2, axis=1, norm="l2")
+
+        # Calculate cosine similarity
+        dot = np.sum(vector1 * vector2, axis=1)
+        score = dot.tolist()
+
+        return score
+
+
 # using pre-trained model to compute the sentence similarity
-# class Similarity():
+# class Similarity:
 #     def __init__(self, config_path, checkpoint_path, dict_path):
 #         self.model1 = build_bert_model(config_path, checkpoint_path, with_pool=True)
-#         self.model = keras.Model(inputs=self.model1.input,
-#                                  outputs=self.model1.get_layer('Encoder-11-FeedForward-Norm').output)
+#         self.model = keras.Model(
+#             inputs=self.model1.input,
+#             outputs=self.model1.get_layer("Encoder-11-FeedForward-Norm").output,
+#         )
 #         # build tokenizer
 #         self.tokenizer = Tokenizer(dict_path, do_lower_case=True)
 #
@@ -55,7 +155,7 @@ device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 #         token_ids2, segment_ids2 = [], []
 #         score = []
 #
-#         for (sent1, sent2) in zip(real, predicted):
+#         for sent1, sent2 in zip(real, predicted):
 #             sent1 = remove_tags(sent1)
 #             sent2 = remove_tags(sent2)
 #
@@ -67,11 +167,19 @@ device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 #             segment_ids1.append(sids1)
 #             segment_ids2.append(sids2)
 #
-#         token_ids1 = keras.preprocessing.sequence.pad_sequences(token_ids1, maxlen=32, padding='post')
-#         token_ids2 = keras.preprocessing.sequence.pad_sequences(token_ids2, maxlen=32, padding='post')
+#         token_ids1 = keras.preprocessing.sequence.pad_sequences(
+#             token_ids1, maxlen=32, padding="post"
+#         )
+#         token_ids2 = keras.preprocessing.sequence.pad_sequences(
+#             token_ids2, maxlen=32, padding="post"
+#         )
 #
-#         segment_ids1 = keras.preprocessing.sequence.pad_sequences(segment_ids1, maxlen=32, padding='post')
-#         segment_ids2 = keras.preprocessing.sequence.pad_sequences(segment_ids2, maxlen=32, padding='post')
+#         segment_ids1 = keras.preprocessing.sequence.pad_sequences(
+#             segment_ids1, maxlen=32, padding="post"
+#         )
+#         segment_ids2 = keras.preprocessing.sequence.pad_sequences(
+#             segment_ids2, maxlen=32, padding="post"
+#         )
 #
 #         vector1 = self.model.predict([token_ids1, segment_ids1])
 #         vector2 = self.model.predict([token_ids2, segment_ids2])
@@ -79,8 +187,8 @@ device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 #         vector1 = np.sum(vector1, axis=1)
 #         vector2 = np.sum(vector2, axis=1)
 #
-#         vector1 = normalize(vector1, axis=0, norm='max')
-#         vector2 = normalize(vector2, axis=0, norm='max')
+#         vector1 = normalize(vector1, axis=0, norm="max")
+#         vector2 = normalize(vector2, axis=0, norm="max")
 #
 #         dot = np.diag(np.matmul(vector1, vector2.T))  # a*b
 #         a = np.diag(np.matmul(vector1, vector1.T))  # a*a
@@ -96,12 +204,20 @@ device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
 def performance(args, SNR, net):
-    # similarity = Similarity(args.bert_config_path, args.bert_checkpoint_path, args.bert_dict_path)
-    bleu_score_1gram = BleuScore(1, 0, 0, 0)
+    if args.compute_similarity:
+        similarity = Similarity("bert_uncased_L-12_H-768_A-12")
+    n_weights = [0, 0, 0, 0]
+    n_weights[args.n_gram - 1] = 1
+    bleu_score_1gram = BleuScore(*n_weights)
 
-    test_eur = EurDataset('test')
-    test_iterator = DataLoader(test_eur, batch_size=args.batch_size, num_workers=0,
-                               pin_memory=True, collate_fn=collate_data)
+    test_eur = EurDataset("test")
+    test_iterator = DataLoader(
+        test_eur,
+        batch_size=args.batch_size,
+        num_workers=0,
+        pin_memory=True,
+        collate_fn=collate_data,
+    )
 
     StoT = SeqtoText(token_to_idx, end_idx)
     score = []
@@ -118,13 +234,19 @@ def performance(args, SNR, net):
                 noise_std = SNR_to_noise(snr)
 
                 for sents in test_iterator:
-
                     sents = sents.to(device)
                     # src = batch.src.transpose(0, 1)[:1]
                     target = sents
 
-                    out = greedy_decode(net, sents, noise_std, args.MAX_LENGTH, pad_idx,
-                                        start_idx, args.channel)
+                    out = greedy_decode(
+                        net,
+                        sents,
+                        noise_std,
+                        args.MAX_LENGTH,
+                        pad_idx,
+                        start_idx,
+                        args.channel,
+                    )
 
                     sentences = out.cpu().numpy().tolist()
                     result_string = list(map(StoT.sequence_to_text, sentences))
@@ -138,31 +260,44 @@ def performance(args, SNR, net):
                 Rx_word.append(target_word)
 
             bleu_score = []
-            sim_score = []
+            if args.compute_similarity:
+                net.cpu()
+                sim_score = []
             for sent1, sent2 in zip(Tx_word, Rx_word):
                 # 1-gram
-                bleu_score.append(bleu_score_1gram.compute_blue_score(sent1, sent2)) # 7*num_sent
-                # sim_score.append(similarity.compute_similarity(sent1, sent2)) # 7*num_sent
+                bleu_score.append(
+                    bleu_score_1gram.compute_blue_score(sent1, sent2)
+                )  # 7*num_sent
+                if args.compute_similarity:
+                    sim_score.append(
+                        similarity.compute_similarity(sent1, sent2)
+                    )  # 7*num_sent
             bleu_score = np.array(bleu_score)
             bleu_score = np.mean(bleu_score, axis=1)
             score.append(bleu_score)
 
-            # sim_score = np.array(sim_score)
-            # sim_score = np.mean(sim_score, axis=1)
-            # score2.append(sim_score)
+            if args.compute_similarity:
+                sim_score = np.array(sim_score)
+                sim_score = np.mean(sim_score, axis=1)
+                score2.append(sim_score)
+                net.cuda()
 
     score1 = np.mean(np.array(score), axis=0)
-    # score2 = np.mean(np.array(score2), axis=0)
+    if args.compute_similarity:
+        score2 = np.mean(np.array(score2), axis=0)
+    else:
+        score2 = []
 
-    return score1#, score2
+    return score1, score2
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     args = parser.parse_args()
-    SNR = [0,3,6,9,12,15,18]
+    SNR = [0, 3, 6, 9, 12, 15, 18]
 
-    args.vocab_file = '/import/antennas/Datasets/hx301/' + args.vocab_file
-    vocab = json.load(open(args.vocab_file, 'rb'))
-    token_to_idx = vocab['token_to_idx']
+    args.vocab_file = "./" + args.vocab_file
+    vocab = json.load(open(args.vocab_file, "rb"))
+    token_to_idx = vocab["token_to_idx"]
     idx_to_token = dict(zip(token_to_idx.values(), token_to_idx.keys()))
     num_vocab = len(token_to_idx)
     pad_idx = token_to_idx["<PAD>"]
@@ -170,14 +305,23 @@ if __name__ == '__main__':
     end_idx = token_to_idx["<END>"]
 
     """ define optimizer and loss function """
-    deepsc = DeepSC(args.num_layers, num_vocab, num_vocab,
-                        num_vocab, num_vocab, args.d_model, args.num_heads,
-                        args.dff, 0.1).to(device)
+    deepsc = DeepSC(
+        args.num_layers,
+        num_vocab,
+        num_vocab,
+        num_vocab,
+        num_vocab,
+        args.d_model,
+        args.num_heads,
+        args.dff,
+        0.1,
+    ).to(device)
 
     model_paths = []
     for fn in os.listdir(args.checkpoint_path):
-        if not fn.endswith('.pth'): continue
-        idx = int(os.path.splitext(fn)[0].split('_')[-1])  # read the idx of image
+        if not fn.endswith(".pth"):
+            continue
+        idx = int(os.path.splitext(fn)[0].split("_")[-1])  # read the idx of image
         model_paths.append((os.path.join(args.checkpoint_path, fn), idx))
 
     model_paths.sort(key=lambda x: x[1])  # sort the image by the idx
@@ -185,9 +329,11 @@ if __name__ == '__main__':
     model_path, _ = model_paths[-1]
     checkpoint = torch.load(model_path)
     deepsc.load_state_dict(checkpoint)
-    print('model load!')
+    print("model load!")
 
-    bleu_score = performance(args, SNR, deepsc)
-    print(bleu_score)
+    bleu_score, sim_score = performance(args, SNR, deepsc)
+    print("BLEU:", bleu_score)
+    if args.compute_similarity:
+        print("Similarity:", sim_score)
 
-    #similarity.compute_similarity(sent1, real)
+    # similarity.compute_similarity(sent1, real)
